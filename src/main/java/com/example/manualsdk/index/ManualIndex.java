@@ -1,6 +1,12 @@
 package com.example.manualsdk.index;
 
 import com.example.manualsdk.model.ManualDocument;
+import com.example.manualsdk.offline.ImportMode;
+import com.example.manualsdk.offline.PackageException;
+import com.example.manualsdk.offline.PackageLimits;
+import com.example.manualsdk.offline.PackageVerifier;
+import com.example.manualsdk.offline.TrustedKeys;
+import com.example.manualsdk.offline.VerifiedPackage;
 import com.example.manualsdk.query.HitRangeExtractor;
 import com.example.manualsdk.query.ManualQuery;
 import com.example.manualsdk.query.QueryCompiler;
@@ -17,7 +23,10 @@ import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.SearcherManager;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.util.BytesRef;
@@ -26,6 +35,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -133,6 +143,61 @@ public final class ManualIndex implements AutoCloseable {
 
     public void deleteAll(List<String> ids) {
         applyBatch(ids.stream().<DocumentOp>map(DocumentOp.Delete::new).toList());
+    }
+
+    /**
+     * Fully verifies an offline package and, only after verification
+     * succeeds, publishes it in one atomic commit. Verification never
+     * touches the index. With {@link ImportMode#REJECT} the whole package is
+     * rejected if any id already exists; with {@link ImportMode#OVERWRITE}
+     * same-id documents are replaced and all other documents are kept.
+     *
+     * The conflict check runs inside the write lock against the latest
+     * committed snapshot, so concurrent imports or batches cannot bypass it.
+     * Any failure happens before the commit and leaves no staged documents
+     * behind. Already open search sessions stay pinned to their snapshot.
+     *
+     * @return the verified package metadata and imported documents
+     */
+    public VerifiedPackage importPackage(java.nio.file.Path packageFile, TrustedKeys trustedKeys,
+                                         ImportMode mode, PackageLimits limits) throws PackageException {
+        ensureOpen();
+        java.util.Objects.requireNonNull(mode, "mode");
+        VerifiedPackage verified = PackageVerifier.verify(packageFile, trustedKeys, limits);
+        synchronized (writeLock) {
+            ensureOpen();
+            List<DocumentOp> operations = new ArrayList<>(verified.documents().size());
+            for (ManualDocument document : verified.documents()) {
+                if (mode == ImportMode.REJECT && documentExists(document.id())) {
+                    throw new PackageException("document id already exists, rejecting package: " + document.id());
+                }
+                operations.add(mode == ImportMode.OVERWRITE
+                        ? DocumentOp.replace(document)
+                        : DocumentOp.add(document));
+            }
+            applyBatch(operations);
+        }
+        return verified;
+    }
+
+    public VerifiedPackage importPackage(java.nio.file.Path packageFile, TrustedKeys trustedKeys, ImportMode mode)
+            throws PackageException {
+        return importPackage(packageFile, trustedKeys, mode, PackageLimits.defaults());
+    }
+
+    /** Must be called while holding {@link #writeLock}. */
+    private boolean documentExists(String id) {
+        try {
+            IndexSearcher searcher = searcherManager.acquire();
+            try {
+                TopDocs hits = searcher.search(new TermQuery(idTerm(id)), 1);
+                return hits.totalHits.value > 0;
+            } finally {
+                searcherManager.release(searcher);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** Atomically replaces the in-memory dictionary; validation failure keeps the old one. */
