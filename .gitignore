@@ -1,7 +1,9 @@
-target/
-.m2/
-.idea/
-*.iml
+/bin/
+/dist/
+/.cache/
+/tmp/
 *.log
 .env
-.DS_Store
+.env.*
+*.key
+*.pem
